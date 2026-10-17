@@ -14,8 +14,8 @@ and everyone's own reactions & pins — using only Telegram's official
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
-[Quick start](#-quick-start) · [How it works](#-system-design) · [Guide](#-step-by-step-guide) ·
-[Limits](#-known-telegram-behaviours) · [FAQ](#-faq)
+[Quick start](#-quick-start) · [Run it](#-running-it) · [System design](#-system-design) · [Internals](#-implementation-deep-dive) ·
+[Guide](#-step-by-step-guide) · [Limits](#-known-telegram-behaviours) · [FAQ](#-faq)
 
 </div>
 
@@ -238,6 +238,176 @@ uploaded document instead of sending the bytes again — in practice ~80 % of at
 
 ---
 
+## 🔬 Implementation deep dive
+
+How each stage works, with the actual rules the code follows. File names link the concepts to the code.
+
+<details>
+<summary><b>1 · Parsing the HTML export</b> — <code>parser.py</code></summary>
+
+- Reads `messages.html`, `messages2.html`, … in numeric order with **lxml**; every `div.message` becomes a
+  normalized `Message` (`models.py`).
+- **Timestamps** come from the `title` attribute (`30.03.2025 17:50:50 UTC+05:30`) and keep their UTC offset.
+- **"Joined" blocks** (consecutive messages from the same person) carry no name in the HTML; the sender is
+  inherited from the previous block.
+- **Replies** and **pins** are resolved from `#go_to_message123` links; **forwards** keep the original author
+  and date; **reactions** keep the emoji and every reacting person's name.
+- **Text** is rebuilt with `<br>` as newlines plus formatting entities (bold, italic, code, strike, spoiler,
+  links) as character offsets.
+- **Media type** is decided from the export's CSS classes (`photo_wrap`, `video_file_wrap`, `animated_wrap`,
+  `media_voice_message`, …) and, for stickers, the file extension (`.tgs` animated, `.webm` video).
+- A broken block never stops the scan: it is recorded in `parse_errors` and reported by `validate`.
+</details>
+
+<details>
+<summary><b>2 · Scanning into SQLite</b> — <code>scanner.py</code>, <code>media.py</code>, <code>database.py</code></summary>
+
+- Every referenced file is resolved **inside** the export only (paths escaping it are rejected), then
+  hashed with **SHA-256** and type-sniffed by **magic bytes** — once per physical file, however often it is
+  referenced.
+- **"Sent together"**: the HTML export doesn't record albums, so adjacent photo/video blocks from the same
+  sender in the same second are marked as a group and labelled `[Sent together: 2/5]`.
+- Each message gets a `content_hash`; duplicates are a validation error.
+- The database is **rebuilt atomically**, and rebuilding is refused once any import has started (it would
+  break resume and auditing).
+</details>
+
+<details>
+<summary><b>3 · Validation</b> — <code>validator.py</code></summary>
+
+Blocking errors: parse failures, IDs or timestamps going backwards, messages without sender/time, sender
+names that would break the chat-line grammar, duplicate import file names, duplicate content hashes.
+Warnings/info: missing or mismatched media files, zero-byte files, unknown content, >4096-char texts,
+replies/pins pointing outside the export, continuation lines that need escaping.
+</details>
+
+<details>
+<summary><b>4 · Rendering the chat file</b> — <code>render.py</code></summary>
+
+Each message becomes WhatsApp-style lines:
+
+```text
+[29/03/2025, 17:50:49] Our chat: ‎Alice created group “Our chat”     ← group header (groups only)
+[30/03/2025, 17:50:50] Alice: Hey!
+[30/03/2025, 17:56:59] Bob: ‎<attached: 00013082-PHOTO-2025-03-30-17-56-59.jpg>
+[30/03/2025, 17:56:59] Bob: [↩ Reply to Alice, 30.03.2025 17:50:50: "Hey!"]
+To this.
+```
+
+Rules, most of them learned from the live API:
+
+| Rule | Why |
+|---|---|
+| Attachment line stands alone; caption/notes follow as a new message with the same time | Text after an attachment makes Telegram drop the media |
+| Unique attachment name `<source_id>-<TYPE>-<timestamp>.<ext>` | Each line maps to exactly one uploaded file |
+| Split at **2,000** chars (single-line) / **1,200** chars (multi-line) | Longer messages are silently dropped |
+| Empty lines → invisible word joiner `U+2060` | Messages with empty lines are lost |
+| Continuation lines that look like `[dd/mm/yyyy, hh:mm…` get a leading word joiner | Otherwise parsed as a new message |
+| Trailing whitespace stripped | Invisible, avoids parser edge cases |
+| `plain` formatting keeps text exact and appends hidden link targets; `whatsapp` adds `*bold*` `_italic_` `~strike~` | The importer doesn't carry entities |
+| Notes for replies, forwards, calls, self-destructing media, albums (`ANNOTATE`) | No native equivalent in an import |
+
+The renderer also records `(line, source_id)` for every message start — the key to matching later.
+</details>
+
+<details>
+<summary><b>5 · Dry run artifacts</b> — <code>dryrun.py</code></summary>
+
+- `chat_NNN.txt` — split into chunks by size (`--max-chunk-mib`, default 30), **only at message starts**.
+- `media_manifest.json` — every attachment with its chunk, hash, size and *upload spec*.
+- `messages_index.json` — `[source_id, original timestamp]` per chat line, in order.
+- `plan.json` — counts, unique media bytes, warnings (e.g. chunks above the 32 MiB Android client limit).
+
+Output is deterministic: the same database and options produce byte-identical files.
+</details>
+
+<details>
+<summary><b>6 · Upload specs and sticker conversion</b> — <code>media.py</code>, <code>importer.py</code></summary>
+
+| Kind | Sent as |
+|---|---|
+| Photo (JPEG/PNG) | `InputMediaUploadedPhoto` |
+| Video | Document `video/mp4`, real width/height/duration probed with hachoir, streaming flag |
+| GIF | Document `video/mp4` + animated attribute (Telegram shows it as a video) |
+| Sticker `.webp` / video sticker `.webm` | Document with sticker attribute (+ 512×512 video attribute for `.webm`) |
+| Animated sticker `.tgs` | Rendered with **rlottie** to PNG frames (≤ 3 s, 30 fps), encoded by **ffmpeg** to VP9 + alpha `.webm`, cached in `work/converted/<sha>.webm`, sent as a video sticker |
+| Voice / audio | Document with audio attribute (voice flag, duration, title) |
+| Anything else | Document with its guessed MIME type and original file name |
+</details>
+
+<details>
+<summary><b>7 · The importer state machine</b> — <code>importer.py</code></summary>
+
+- **Guards first:** refuses basic groups, a second `--full` into the same destination, and a chat file whose
+  SHA-256 was already imported there.
+- `initHistoryImport` → `import_id` is stored, then each attachment goes through `uploadImportedMedia`.
+- **Upload reuse:** after a file is uploaded once, later attachments with the same SHA-256 send the
+  already-uploaded `InputDocument` / `InputPhoto` instead of the bytes (~80 % of attachments in practice).
+  If Telegram ever rejects reuse, it falls back to fresh uploads automatically.
+- Every upload is committed to `import_media` before the next one, so `--resume` skips exactly what's done.
+- `startHistoryImport` runs once; `start_after_id` (the newest message id before the import) is recorded so
+  later matching ignores older messages.
+- `--test` picks a ~40-message sample automatically: the first message of every media and note type, replies,
+  forwards, each person's reactions and pins with their targets, formatted / multi-line / very long texts,
+  photos with and without captions, and one "sent together" group.
+- A JSON report (counts, reuse stats, flood waits, duration) is written next to the batch.
+</details>
+
+<details>
+<summary><b>8 · Matching imported messages back to the source</b> — <code>reactions.py</code></summary>
+
+Telegram gives imported messages new IDs but keeps the original time in `fwd_from.date`. `match()` walks
+the chat (oldest first, after `start_after_id`) and `messages_index.json` together with two pointers:
+
+```text
+for each imported message (id, original_date):
+    advance in the index until an entry with the same timestamp is found
+    pair them; entries skipped over are messages Telegram dropped
+```
+
+- `my_export_name()` figures out which export name *is* the logged-in account by majority vote over the
+  paired messages' real sender IDs — no name guessing.
+- `first_tg_ids()` maps each source message to its first Telegram message (the attachment, or the first
+  part of a split text) — that's where reactions and pins go.
+- The mapping is cached in `tg_map` once at most 1 % is missing, so `react` and `pin` don't re-read
+  hundreds of thousands of messages each time.
+</details>
+
+<details>
+<summary><b>9 · Reactions, pins and verify</b> — <code>reactions.py</code></summary>
+
+- **Reactions:** only emojis whose actor list contains *this* account's export name. Tries all emojis at once
+  (Premium allows several), then the first one with and without the emoji variation selector, because export
+  and server spellings differ. Sent with `add_to_recent=False`. Stops after 20 failures in a row.
+- **Pins:** this account's pins in original order (a message pinned twice uses its latest pin), sent silently;
+  the `MessageActionPinMessage` service messages returned by Telegram are deleted right away. Missing pin rights
+  stop the run with a clear message.
+- **Verify:** pairs everything, then reports unmatched index entries with date, sender, type, length and
+  split part — never the text.
+- Results go to `reactions_sent` / `pins_sent` keyed by (destination, message, user): rerunning sends only
+  what's missing or failed.
+</details>
+
+<details>
+<summary><b>10 · Rate limits</b> — <code>telegram_api.py</code></summary>
+
+`call_with_flood()` wraps every write: on `FLOOD_WAIT_X` it sleeps `X + 1` seconds if `X ≤ --max-flood-wait`
+(default 900), up to 3 times per request; otherwise it raises `FloodStop`, which the importer turns into a
+clean stop with progress saved. The importer disables Telethon's own auto-sleep so every wait goes through
+this one policy.
+</details>
+
+<details>
+<summary><b>11 · Testing strategy</b> — <code>tests/</code></summary>
+
+- `conftest.py` builds tiny **synthetic** Telegram exports on the fly — no real chats in the repo.
+- Parser, ordering, rendering, media specs, config and database are unit-tested directly.
+- The importer runs end-to-end against a **fake Telegram client**: full flow, upload reuse + fallback,
+  flood-wait stop and resume, duplicate refusal, abandon.
+- Matching, reaction/pin planning, emoji fallbacks and the missing-message report have their own tests.
+</details>
+---
+
 ## 🧰 Requirements
 
 - 🐍 Python **3.11+** (Windows, macOS, Linux)
@@ -269,6 +439,86 @@ ANNOTATE=replies,forwards,service,calls,ttl,albums
 Every command that changes something in Telegram shows a summary and makes you type a confirmation word.
 No surprises. 🙅
 
+---
+
+## 🏃 Running it
+
+### First login
+
+The first command that talks to Telegram (`probe`, `create-group` or `import`) logs you in interactively:
+
+```text
+Please enter your phone (or bot token): +15551234567
+Please enter the code you received: 12345
+Please enter your password:            # only if you use two-step verification
+Signed in successfully as Your Name
+```
+
+The session is saved to `work/telegram.session` (or `TG_SESSION`), so you only do this once. Treat that file
+like a password — it is git-ignored and never leaves your machine.
+
+### What a write looks like
+
+Nothing changes in Telegram until you type the confirmation word:
+
+```text
+──────────────────────────── CONFIRM IMPORT ────────────────────────────
+SOURCE       /path/to/ChatExport_YYYY-MM-DD
+DESTINATION  group Our chat (id 1234567890)
+MESSAGES     247,569 in 1 import file(s) [full-ios-20261002-171137, format ios]
+MEDIA        24,549 attachments, 4,583 unique files (1,492.9 MiB)
+
+Imported messages will appear at the time and date when they were sent.
+Type IMPORT to continue: IMPORT
+chat_001.txt media ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 24549/24549 0:00:00
+Import started for all chunks. Telegram processes it in the background.
+Report: work/imports/full-ios-20261002-171137/import_report.json
+```
+
+…and checking the result:
+
+```text
+─────────────────────────────── VERIFY ───────────────────────────────
+FOUND        247,324 of 247,568 chat lines
+MISSING      244: text 204, long text 40
+  2025-04-01T12:11:10  Name A        text        103 chars
+  2025-04-10T01:56:53  Name B        text        795 chars
+  ... and 242 more
+Full list (dates and sizes only): work/verify_report.json
+```
+
+### Long runs
+
+A big import uploads for hours. Keep the machine awake and log the output:
+
+| OS | Keep awake + log |
+|---|---|
+| Windows (PowerShell) | `powercfg /change standby-timeout-ac 0` then `python main.py import --full 2>&1 \| Tee-Object import.log` |
+| macOS | `caffeinate -i python main.py import --full 2>&1 \| tee import.log` |
+| Linux | `systemd-inhibit python main.py import --full 2>&1 \| tee import.log` |
+
+Check progress from a second terminal with `python main.py status` (offline, reads SQLite).
+
+### Stop and resume — anytime
+
+| You want to… | Do this | What happens |
+|---|---|---|
+| Pause an upload | `Ctrl+C` | Every finished upload is already journaled |
+| Continue it | `python main.py import --resume` | Same Telegram import session, skips uploaded files |
+| Throw it away (before it started) | `python main.py import --abandon` | Nothing was ever visible in the chat |
+| Pause reactions / pins | `Ctrl+C` | Each sent reaction / pin is journaled |
+| Continue them | run `react` / `pin` again | Skips everything already done |
+
+> Don't leave an *unstarted* import paused for many hours — Telegram may expire its session
+> (`IMPORT_ID_INVALID`), which means uploading again. Reactions and pins never expire.
+
+### Rules of thumb
+
+- **One command at a time per session.** Two processes on the same session file → `database is locked`.
+- **Second person = second session.** They run `react` / `pin` with `--session work/other` and log in
+  with *their* phone; add `--logout` to remove that session from your machine afterwards.
+- **Don't delete messages in the group** between `import` and `react` / `pin` — the saved message mapping
+  points at them.
 ---
 
 ## 🗺️ Step-by-step guide
