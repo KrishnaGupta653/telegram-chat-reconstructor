@@ -417,6 +417,9 @@ this one policy.
 
 ## 🚀 Quick start
 
+> 🤖 **Prefer an AI to walk you through it?** Give [`AI_SETUP.md`](AI_SETUP.md) to your coding assistant
+> (Cursor, Claude Code, Copilot…) with: *"Read AI_SETUP.md and follow it exactly."*
+
 ```bash
 git clone https://github.com/KrishnaGupta653/telegram-chat-reconstructor.git
 cd telegram-chat-reconstructor
@@ -742,8 +745,7 @@ telegram_restore/
   database.py              SQLite schema + helpers
 tests/                     synthetic fixtures + fake Telegram client (no real data, no network)
 scripts/                   read-only analysis tools (census, probes, redacted preview)
-CLAUDE.md · .cursor/rules/ coding guidelines for humans and AI assistants
-```
+AI_SETUP.md                step-by-step setup guide to hand to an AI assistant```
 
 ## 👩‍💻 Development
 
@@ -752,8 +754,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-Contributions welcome. House rules live in [`CLAUDE.md`](CLAUDE.md) (mirrored in `.cursor/rules/`):
-think before coding, keep it simple, make surgical changes, prove it with a test.
+Contributions welcome: think before coding, keep it simple, make surgical changes, prove it with a test.
 
 ## 🤝 Responsible use
 
