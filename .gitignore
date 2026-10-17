@@ -1,0 +1,19 @@
+# secrets and Telegram sessions
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# generated data (contains private chat content)
+work/
+census/
+*.sqlite3
+*.sqlite3-*
+census_output.txt
+samples_output.txt
+
+# python
+.venv/
+__pycache__/
+.pytest_cache/
